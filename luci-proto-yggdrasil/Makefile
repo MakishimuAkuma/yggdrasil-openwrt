@@ -12,6 +12,6 @@ LUCI_PKGARCH:=all
 PKG_VERSION:=1.1.1
 PKG_MAINTAINER:=William Fleurant <meshnet@protonmail.com>
 
-include ../../luci.mk
+include $(TOPDIR)/feeds/luci/luci.mk
 
 # call BuildPackage - OpenWrt buildroot signature
