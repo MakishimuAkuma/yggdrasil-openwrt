@@ -1,536 +1,604 @@
 name: Build Yggdrasil OpenWrt APK
 
 on:
-  release:
-    types:
-      - published
-
+  schedule:
+    - cron: "0 */6 * * *"
   workflow_dispatch:
-    inputs:
-      release_tag:
-        description: "Existing GitHub Release tag"
-        required: true
-        type: string
 
 permissions:
   contents: write
 
 env:
-  # OpenWrt release branch (used only for display / checkout references).
-  OPENWRT_BRANCH: openwrt-25.12
-
-  # OpenWrt SDK Docker image tag suffix.
-  # IMPORTANT: openwrt/sdk images on Docker Hub are tagged as
-  # "<arch>-<version>" using the plain release VERSION (e.g. "25.12.4"),
-  # NOT the git branch name ("openwrt-25.12"). Using the branch name here
-  # produces a tag that does not exist and "docker pull" fails for every
-  # matrix job. Update this whenever you bump to a new point release.
-  OPENWRT_VERSION: 25.12.4
-
+  OPENWRT_VERSION: 25.12.5
+  FEED_BRANCH: gh-pages
+  FEED_ROOT: 25.12
 
 jobs:
+  check:
+    name: Check Yggdrasil stable release
+    runs-on: [self-hosted, Linux, X64]
 
-  # ============================================================
-  # BUILD YGGDRASIL
-  # ============================================================
-
-  build-yggdrasil:
-    name: Build Yggdrasil (${{ matrix.arch }})
-    runs-on: ubuntu-latest
-
-    strategy:
-      fail-fast: false
-
-      matrix:
-        arch:
-          - arm_cortex-a7
-          - arm_cortex-a9
-          - arm_cortex-a15_neon-vfpv4
-
-          - aarch64_cortex-a53
-          - aarch64_cortex-a72
-          - rockchip-armv8
-          - aarch64_generic
-
-          - i386_pentium4
-          - x86_64
-
-          - mipsel_24kc
-          - mips_mips32
-          - mips64_octeonplus
-
-          - riscv64_generic
+    outputs:
+      build: ${{ steps.check.outputs.build }}
+      tag: ${{ steps.check.outputs.tag }}
+      version: ${{ steps.check.outputs.version }}
+      hash: ${{ steps.check.outputs.hash }}
 
     steps:
-
-      # ----------------------------------------------------------
-      # Checkout
-      # ----------------------------------------------------------
-
       - name: Checkout package feed
         uses: actions/checkout@v4
         with:
-          ref: main
+          ref: ${{ github.ref_name }}
           fetch-depth: 1
 
+      - name: Check runner prerequisites
+        shell: bash
+        run: |
+          set -e
+          command -v docker
+          command -v sudo
+          command -v curl
+          command -v jq
+          command -v git
+          command -v sha256sum
 
-      # ----------------------------------------------------------
-      # Verify package
-      # ----------------------------------------------------------
+      - name: Check latest stable Yggdrasil
+        id: check
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          echo "Checking Yggdrasil stable releases..."
+
+          RELEASE="$(
+            curl -fsSL \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              ${GITHUB_TOKEN:+-H "Authorization: Bearer ${GITHUB_TOKEN}"} \
+              "https://api.github.com/repos/yggdrasil-network/yggdrasil-go/releases?per_page=30" |
+            jq -er '
+              [
+                .[]
+                | select(.draft == false and .prerelease == false)
+              ][0]
+            '
+          )"
+
+          TAG="$(jq -er '.tag_name' <<<"$RELEASE")"
+
+          case "$TAG" in
+            v[0-9]*)
+              ;;
+            *)
+              echo "ERROR: Unexpected stable release tag: $TAG"
+              exit 1
+              ;;
+          esac
+
+          VERSION="${TAG#v}"
+
+          CURRENT="$(
+            sed -n 's/^PKG_VERSION:=//p' yggdrasil/Makefile |
+            head -n1
+          )"
+
+          if [ -z "$CURRENT" ]; then
+            echo "ERROR: PKG_VERSION not found"
+            exit 1
+          fi
+
+          echo "Upstream stable: $VERSION ($TAG)"
+          echo "Package version:  $CURRENT"
+
+          RELEASE_STATUS="$(
+            curl -sS -o /dev/null -w '%{http_code}' \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              ${GITHUB_TOKEN:+-H "Authorization: Bearer ${GITHUB_TOKEN}"} \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}"
+          )"
+
+          if [ "$CURRENT" = "$VERSION" ]; then
+            if [ "$RELEASE_STATUS" = "200" ]; then
+              echo "GitHub Release $TAG already exists."
+              echo "build=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            elif [ "$RELEASE_STATUS" != "404" ]; then
+              echo "ERROR: Unexpected GitHub Release API status: $RELEASE_STATUS"
+              exit 1
+            fi
+
+            echo "GitHub Release $TAG does not exist. Rebuilding $TAG."
+          elif [ "$(printf '%s\n' "$CURRENT" "$VERSION" | sort -V | tail -n1)" = "$CURRENT" ]; then
+            echo "Local package version $CURRENT is newer than upstream stable $VERSION."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          else
+            echo "New Yggdrasil version detected: $CURRENT -> $VERSION"
+          fi
+
+          SOURCE_URL="https://codeload.github.com/yggdrasil-network/yggdrasil-go/tar.gz/v${VERSION}"
+
+          echo "Downloading source:"
+          echo "$SOURCE_URL"
+
+          HASH="$(
+            curl -fsSL "$SOURCE_URL" |
+            sha256sum |
+            awk '{print $1}'
+          )"
+
+          echo "Source SHA256: $HASH"
+
+          echo "build=true" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "hash=$HASH" >> "$GITHUB_OUTPUT"
+
+  discover:
+    name: Discover OpenWrt 25.12.5 architectures
+    runs-on: [self-hosted, Linux, X64]
+
+    outputs:
+      matrix: ${{ steps.discover.outputs.matrix }}
+      count: ${{ steps.discover.outputs.count }}
+
+    steps:
+      - name: Discover supported Yggdrasil architectures
+        id: discover
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BASE="https://downloads.openwrt.org/releases/${OPENWRT_VERSION}/packages"
+
+          CANDIDATES=(
+            arm_cortex-a7
+            arm_cortex-a9
+            arm_cortex-a15_neon-vfpv4
+            aarch64_cortex-a53
+            aarch64_cortex-a72
+            rockchip-armv8
+            aarch64_generic
+            i386_pentium4
+            x86_64
+            mipsel_24kc
+            mips_mips32
+            mips64_octeonplus
+            riscv64_generic
+          )
+
+          ARCHS=()
+
+          for ARCH in "${CANDIDATES[@]}"; do
+            if curl -fsI "${BASE}/${ARCH}/" >/dev/null 2>&1; then
+              ARCHS+=("$ARCH")
+            else
+              echo "Skipping unavailable OpenWrt package architecture: $ARCH"
+            fi
+          done
+
+          if [ "${#ARCHS[@]}" -eq 0 ]; then
+            echo "ERROR: No supported architectures found"
+            exit 1
+          fi
+
+          JSON="$(
+            printf '%s\n' "${ARCHS[@]}" |
+            jq -R -s -c 'split("\n") | map(select(length > 0))'
+          )"
+
+          MATRIX="$(jq -cn --argjson arch "$JSON" '{arch: $arch}')"
+
+          echo "Architectures:"
+          printf '  %s\n' "${ARCHS[@]}"
+
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+          echo "count=${#ARCHS[@]}" >> "$GITHUB_OUTPUT"
+
+  build-yggdrasil:
+    name: Build Yggdrasil (${{ matrix.arch }})
+    needs:
+      - check
+      - discover
+    if: needs.check.outputs.build == 'true'
+
+    runs-on: [self-hosted, Linux, X64]
+
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ${{ fromJSON(needs.discover.outputs.matrix).arch }}
+
+    steps:
+      - name: Checkout package feed
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 1
+
+      - name: Update Yggdrasil package metadata
+        shell: bash
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+          HASH: ${{ needs.check.outputs.hash }}
+        run: |
+          set -euo pipefail
+
+          SOURCE_URL="https://codeload.github.com/yggdrasil-network/yggdrasil-go/tar.gz/v${VERSION}"
+
+          sed -i \
+            -e "s/^PKG_VERSION:=.*/PKG_VERSION:=${VERSION}/" \
+            -e "s#^PKG_SOURCE_URL:=.*#PKG_SOURCE_URL:=${SOURCE_URL}#" \
+            -e "s/^PKG_HASH:=.*/PKG_HASH:=${HASH}/" \
+            yggdrasil/Makefile
+
+          grep -E '^PKG_(NAME|VERSION|RELEASE|SOURCE|SOURCE_URL|SOURCE_SUBDIR|HASH):' \
+            yggdrasil/Makefile
 
       - name: Verify Yggdrasil package
         shell: bash
         run: |
-          set -e
-
-          echo "========================================"
-          echo "Package:      Yggdrasil"
-          echo "Architecture: ${{ matrix.arch }}"
-          echo "OpenWrt:      ${{ env.OPENWRT_BRANCH }} (SDK ${{ env.OPENWRT_VERSION }})"
-          echo "========================================"
+          set -euo pipefail
 
           test -f yggdrasil/Makefile
           test -f yggdrasil/files/yggdrasil.sh
 
-          echo
-          echo "Package metadata:"
-          grep -E \
-            '^PKG_(NAME|VERSION|RELEASE|SOURCE|SOURCE_URL|SOURCE_SUBDIR|HASH):' \
-            yggdrasil/Makefile
+      - name: Prepare SDK directories
+        shell: bash
+        run: |
+          mkdir -p artifacts feed
 
-
-      # ----------------------------------------------------------
-      # Build
-      # ----------------------------------------------------------
+      - name: Verify APK signing key
+        shell: bash
+        env:
+          APK_SIGNING_KEY: ${{ secrets.APK_SIGNING_KEY }}
+        run: |
+          test -n "${APK_SIGNING_KEY:-}"
 
       - name: Build OpenWrt Yggdrasil package
         uses: openwrt/gh-action-sdk@main
         env:
           ARCH: ${{ matrix.arch }}-${{ env.OPENWRT_VERSION }}
-
           FEEDNAME: action
           PACKAGES: yggdrasil
-
           NO_REFRESH_CHECK: 1
           NO_SHFMT_CHECK: 1
-
           BUILD_LOG: 1
-
-          # Verbose compiler/linker output (V=s) so the actual go build
-          # error shows up directly in the step log instead of being
-          # swallowed by the generic "failed to build" summary.
           V: s
-
-
-      # ----------------------------------------------------------
-      # Upload full build log (always, even on failure)
-      # ----------------------------------------------------------
+          INDEX: 1
+          PRIVATE_KEY: ${{ secrets.APK_SIGNING_KEY }}
+          ARTIFACTS_DIR: artifacts
+          FEED_DIR: feed
 
       - name: Upload Yggdrasil build log
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: yggdrasil-build-log-${{ matrix.arch }}
-          path: logs/
+          path: artifacts/logs/
           if-no-files-found: ignore
           retention-days: 7
-
-
-      # ----------------------------------------------------------
-      # Find APK
-      # ----------------------------------------------------------
 
       - name: Find Yggdrasil APK
         id: apk
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
-          APK="$(find bin \
-            -type f \
-            -name 'yggdrasil-*.apk' \
-            | head -n 1)"
+          APK="$(find artifacts/bin -type f -name 'yggdrasil-*.apk' | head -n1)"
 
           if [ -z "$APK" ]; then
             echo "ERROR: Yggdrasil APK not found"
-
-            echo
-            echo "Available APK files:"
-            find bin \
-              -type f \
-              -name '*.apk' \
-              -print \
-              | sort || true
-
+            find artifacts/bin -type f -name '*.apk' -print | sort || true
             exit 1
           fi
 
-          echo
-          echo "Found Yggdrasil APK:"
-          echo "$APK"
-
           echo "source=$APK" >> "$GITHUB_OUTPUT"
-
-
-      # ----------------------------------------------------------
-      # Rename APK
-      # ----------------------------------------------------------
 
       - name: Rename Yggdrasil APK
         id: renamed
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
           SOURCE="${{ steps.apk.outputs.source }}"
-
           DIR="$(dirname "$SOURCE")"
           BASE="$(basename "$SOURCE" .apk)"
-
           TARGET="${DIR}/${BASE}-${{ matrix.arch }}.apk"
 
           mv "$SOURCE" "$TARGET"
-
-          echo "Renamed:"
-          echo "$TARGET"
-
           echo "path=$TARGET" >> "$GITHUB_OUTPUT"
 
+      - name: Collect Yggdrasil artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
 
-      # ----------------------------------------------------------
-      # Upload artifact
-      # ----------------------------------------------------------
+          mkdir -p "publish/apk" "publish/feed"
+
+          cp "${{ steps.renamed.outputs.path }}"             "publish/apk/"
+
+          FEED_INDEX="$(find artifacts/bin/packages -type f -path '*/action/packages.adb' | head -n1)"
+          test -n "$FEED_INDEX"
+
+          cp "$FEED_INDEX" "publish/feed/packages.adb"
 
       - name: Upload Yggdrasil APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: yggdrasil-apk-${{ matrix.arch }}
-          path: ${{ steps.renamed.outputs.path }}
+          name: yggdrasil-artifact-${{ matrix.arch }}
+          path: publish/apk/*.apk
           if-no-files-found: error
           retention-days: 7
 
-
-  # ============================================================
-  # BUILD LUCI
-  # ============================================================
+      - name: Upload Yggdrasil feed artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: yggdrasil-feed-${{ matrix.arch }}
+          path: publish/feed/packages.adb
+          if-no-files-found: error
+          retention-days: 7
 
   build-luci:
     name: Build LuCI
-    runs-on: ubuntu-latest
+    needs:
+      - check
+    if: needs.check.outputs.build == 'true'
+
+    runs-on: [self-hosted, Linux, X64]
 
     steps:
-
-      # ----------------------------------------------------------
-      # Checkout
-      # ----------------------------------------------------------
-
       - name: Checkout package feed
         uses: actions/checkout@v4
         with:
-          ref: main
+          ref: ${{ github.ref_name }}
           fetch-depth: 1
 
+      - name: Update Yggdrasil package metadata
+        shell: bash
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+          HASH: ${{ needs.check.outputs.hash }}
+        run: |
+          set -euo pipefail
 
-      # ----------------------------------------------------------
-      # Verify packages
-      # ----------------------------------------------------------
+          SOURCE_URL="https://codeload.github.com/yggdrasil-network/yggdrasil-go/tar.gz/v${VERSION}"
 
-      - name: Verify LuCI and Yggdrasil packages
+          sed -i \
+            -e "s/^PKG_VERSION:=.*/PKG_VERSION:=${VERSION}/" \
+            -e "s#^PKG_SOURCE_URL:=.*#PKG_SOURCE_URL:=${SOURCE_URL}#" \
+            -e "s/^PKG_HASH:=.*/PKG_HASH:=${HASH}/" \
+            yggdrasil/Makefile
+
+      - name: Verify LuCI package
         shell: bash
         run: |
-          set -e
-
-          echo "========================================"
-          echo "Packages:"
-          echo "  - yggdrasil"
-          echo "  - luci-proto-yggdrasil"
-          echo "Architecture: x86_64"
-          echo "OpenWrt:      ${{ env.OPENWRT_BRANCH }} (SDK ${{ env.OPENWRT_VERSION }})"
-          echo "========================================"
+          set -euo pipefail
 
           test -f yggdrasil/Makefile
           test -f yggdrasil/files/yggdrasil.sh
-
           test -f luci-proto-yggdrasil/Makefile
+          test -f luci-proto-yggdrasil/root/usr/libexec/rpcd/luci.yggdrasil
+          test -f luci-proto-yggdrasil/root/usr/libexec/rpcd/luci.yggdrasil-jumper
+          test -f luci-proto-yggdrasil/root/usr/share/rpcd/acl.d/luci-proto-yggdrasil.json
+          test -f luci-proto-yggdrasil/htdocs/luci-static/resources/protocol/yggdrasil.js
 
-          test -f \
-            luci-proto-yggdrasil/root/usr/libexec/rpcd/luci.yggdrasil
+      - name: Prepare SDK directories
+        shell: bash
+        run: |
+          mkdir -p artifacts feed
 
-          test -f \
-            luci-proto-yggdrasil/root/usr/libexec/rpcd/luci.yggdrasil-jumper
-
-          test -f \
-            luci-proto-yggdrasil/root/usr/share/rpcd/acl.d/luci-proto-yggdrasil.json
-
-          test -f \
-            luci-proto-yggdrasil/htdocs/luci-static/resources/protocol/yggdrasil.js
-
-          echo
-          echo "Yggdrasil metadata:"
-          grep -E \
-            '^PKG_(NAME|VERSION|RELEASE|SOURCE|SOURCE_URL|SOURCE_SUBDIR|HASH):' \
-            yggdrasil/Makefile || true
-
-          echo
-          echo "LuCI metadata:"
-          grep -E \
-            '^(LUCI_TITLE|LUCI_DEPENDS|LUCI_PKGARCH|PKG_VERSION|PKG_MAINTAINER):' \
-            luci-proto-yggdrasil/Makefile || true
-
-
-      # ----------------------------------------------------------
-      # Build LuCI + Yggdrasil
-      # ----------------------------------------------------------
+      - name: Verify APK signing key
+        shell: bash
+        env:
+          APK_SIGNING_KEY: ${{ secrets.APK_SIGNING_KEY }}
+        run: |
+          test -n "${APK_SIGNING_KEY:-}"
 
       - name: Build OpenWrt LuCI package
         uses: openwrt/gh-action-sdk@main
         env:
           ARCH: x86_64-${{ env.OPENWRT_VERSION }}
-
           FEEDNAME: action
-
-          # IMPORTANT:
-          # Build Yggdrasil together with LuCI.
-          #
-          # luci-proto-yggdrasil contains:
-          #
-          #   LUCI_DEPENDS:=+yggdrasil
-          #
-          # Therefore Yggdrasil must be available in this SDK build.
           PACKAGES: yggdrasil luci-proto-yggdrasil
-
           NO_REFRESH_CHECK: 1
           NO_SHFMT_CHECK: 1
-
           BUILD_LOG: 1
-
           V: s
-
-
-      # ----------------------------------------------------------
-      # Upload full build log (always, even on failure)
-      # ----------------------------------------------------------
+          INDEX: 1
+          PRIVATE_KEY: ${{ secrets.APK_SIGNING_KEY }}
+          ARTIFACTS_DIR: artifacts
+          FEED_DIR: feed
 
       - name: Upload LuCI build log
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: luci-build-log
-          path: logs/
+          path: artifacts/logs/
           if-no-files-found: ignore
           retention-days: 7
-
-
-      # ----------------------------------------------------------
-      # Find LuCI APK
-      # ----------------------------------------------------------
 
       - name: Find LuCI APK
         id: apk
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
-          APK="$(find bin \
-            -type f \
-            -name 'luci-proto-yggdrasil-*.apk' \
-            | head -n 1)"
+          APK="$(find artifacts/bin -type f -name 'luci-proto-yggdrasil-*.apk' | head -n1)"
 
           if [ -z "$APK" ]; then
-            echo "ERROR: LuCI APK not found"
-
-            echo
-            echo "Available APK files:"
-            find bin \
-              -type f \
-              -name '*.apk' \
-              -print \
-              | sort || true
-
+            echo "ERROR: luci-proto-yggdrasil APK not found"
+            find artifacts/bin -type f -name '*.apk' -print | sort || true
             exit 1
           fi
 
-          echo
-          echo "Found LuCI APK:"
-          echo "$APK"
-
           echo "source=$APK" >> "$GITHUB_OUTPUT"
 
+      - name: Collect LuCI artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
 
-      # ----------------------------------------------------------
-      # Upload LuCI artifact
-      # ----------------------------------------------------------
+          mkdir -p publish/apk publish/feed
+
+          cp "${{ steps.apk.outputs.source }}" publish/apk/
+
+          FEED_INDEX="$(find artifacts/bin/packages -type f -path '*/action/packages.adb' | head -n1)"
+          test -n "$FEED_INDEX"
+          cp "$FEED_INDEX" publish/feed/packages.adb
 
       - name: Upload LuCI APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: luci-proto-yggdrasil-apk
-          path: ${{ steps.apk.outputs.source }}
+          name: luci-proto-yggdrasil-artifact
+          path: publish/apk/*.apk
           if-no-files-found: error
           retention-days: 7
 
-
-  # ============================================================
-  # RELEASE
-  # ============================================================
+      - name: Upload LuCI feed artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: luci-proto-yggdrasil-feed
+          path: publish/feed/packages.adb
+          if-no-files-found: error
+          retention-days: 7
 
   release:
-    name: Publish APKs to GitHub Release
-
+    name: Create Yggdrasil GitHub Release
     needs:
+      - check
+      - discover
       - build-yggdrasil
       - build-luci
+    if: needs.check.outputs.build == 'true'
 
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
 
     steps:
-
-      # ----------------------------------------------------------
-      # Determine Release tag
-      # ----------------------------------------------------------
-
-      - name: Determine release tag
-        id: release_tag
-        shell: bash
-        env:
-          EVENT_TAG: ${{ github.event.release.tag_name }}
-          MANUAL_TAG: ${{ inputs.release_tag }}
-        run: |
-          set -e
-
-          if [ -n "$EVENT_TAG" ]; then
-            TAG="$EVENT_TAG"
-          else
-            TAG="$MANUAL_TAG"
-          fi
-
-          if [ -z "$TAG" ]; then
-            echo "ERROR: Release tag is empty"
-            exit 1
-          fi
-
-          echo "Using Release:"
-          echo "$TAG"
-
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-
-
-      # ----------------------------------------------------------
-      # Download Yggdrasil artifacts
-      # ----------------------------------------------------------
-
-      - name: Download Yggdrasil APK artifacts
+      - name: Download Yggdrasil artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: yggdrasil-apk-*
+          pattern: yggdrasil-artifact-*
           path: release
           merge-multiple: true
 
-
-      # ----------------------------------------------------------
-      # Download LuCI artifact
-      # ----------------------------------------------------------
-
-      - name: Download LuCI APK artifact
+      - name: Download LuCI artifacts
         uses: actions/download-artifact@v4
         with:
-          name: luci-proto-yggdrasil-apk
+          name: luci-proto-yggdrasil-artifact
           path: release
-
-
-      # ----------------------------------------------------------
-      # List APKs
-      # ----------------------------------------------------------
-
-      - name: List APKs
-        shell: bash
-        run: |
-          set -e
-
-          echo "========================================"
-          echo "APKs to upload"
-          echo "========================================"
-
-          find release \
-            -type f \
-            -name '*.apk' \
-            -print \
-            | sort
-
-          COUNT="$(find release -type f -name '*.apk' | wc -l)"
-
-          echo
-          echo "Found $COUNT APK(s)"
-
-          if [ "$COUNT" -ne 14 ]; then
-            echo
-            echo "ERROR: Expected 14 APKs"
-            echo "       13 Yggdrasil + 1 LuCI"
-
-            exit 1
-          fi
-
-
-      # ----------------------------------------------------------
-      # Verify expected packages
-      # ----------------------------------------------------------
 
       - name: Verify APK set
         shell: bash
+        env:
+          EXPECTED_COUNT: ${{ needs.discover.outputs.count }}
         run: |
-          set -e
+          set -euo pipefail
 
-          EXPECTED_ARCHS="
-          arm_cortex-a7
-          arm_cortex-a9
-          arm_cortex-a15_neon-vfpv4
-          aarch64_cortex-a53
-          aarch64_cortex-a72
-          rockchip-armv8
-          aarch64_generic
-          i386_pentium4
-          x86_64
-          mipsel_24kc
-          mips_mips32
-          mips64_octeonplus
-          riscv64_generic
-          "
+          COUNT="$(find release -type f -name '*.apk' | wc -l)"
+          EXPECTED=$((EXPECTED_COUNT + 1))
 
-          for ARCH in $EXPECTED_ARCHS; do
-            if ! find release \
-              -type f \
-              -name "yggdrasil-*-${ARCH}.apk" \
-              | grep -q .; then
+          echo "Found ${COUNT} APK(s); expected ${EXPECTED}."
 
-              echo "ERROR: Missing Yggdrasil APK for ${ARCH}"
-              exit 1
-            fi
-          done
-
-          if ! find release \
-            -type f \
-            -name 'luci-proto-yggdrasil-*.apk' \
-            | grep -q .; then
-
-            echo "ERROR: Missing luci-proto-yggdrasil APK"
+          if [ "$COUNT" -ne "$EXPECTED" ]; then
+            find release -type f -name '*.apk' -print | sort
             exit 1
           fi
 
-          echo
-          echo "All expected APKs are present."
+          find release -type f -name '*.apk' -print | sort
 
-
-      # ----------------------------------------------------------
-      # Upload APKs to Release
-      # ----------------------------------------------------------
-
-      - name: Upload APKs to Release
-        uses: softprops/action-gh-release@v2
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ steps.release_tag.outputs.tag }}
+          tag_name: ${{ needs.check.outputs.tag }}
+          name: Yggdrasil ${{ needs.check.outputs.tag }}
+          generate_release_notes: true
           files: |
             release/*.apk
-          fail_on_unmatched_files: true
-          overwrite_files: true
+            release/*.pub.pem
+          fail_on_unmatched_files: false
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Download feed artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: yggdrasil-feed-*
+          path: feed
+
+      - name: Download LuCI feed artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: luci-proto-yggdrasil-feed
+          path: luci-feed
+
+      - name: Prepare OpenWrt APK feed
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf "feed-publish"
+          mkdir -p "feed-publish"
+
+          for DIR in feed/yggdrasil-feed-*; do
+            [ -d "$DIR" ] || continue
+            ARCH="$(basename "$DIR" | sed 's/^yggdrasil-feed-//')"
+            mkdir -p "feed-publish/${ARCH}"
+            cp "$DIR/packages.adb" "feed-publish/${ARCH}/packages.adb"
+          done
+
+          # The x86_64 LuCI build contains both yggdrasil and
+          # luci-proto-yggdrasil in its packages.adb.
+          mkdir -p feed-publish/x86_64
+          cp luci-feed/packages.adb feed-publish/x86_64/packages.adb
+
+          find feed-publish -type f -print | sort
+
+      - name: Generate public feed key
+        shell: bash
+        env:
+          APK_SIGNING_KEY: ${{ secrets.APK_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+
+          test -n "${APK_SIGNING_KEY:-}"
+
+          printf '%s\n' "$APK_SIGNING_KEY" > yggdrasil-feed-private.pem
+          chmod 600 yggdrasil-feed-private.pem
+
+          openssl pkey             -in yggdrasil-feed-private.pem             -pubout             -out yggdrasil-feed.pem
+
+          rm -f yggdrasil-feed-private.pem
+
+      - name: Publish OpenWrt APK feed
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git clone --depth 1 --branch "${FEED_BRANCH}" \
+            "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            gh-pages
+
+          rm -rf "gh-pages/${FEED_ROOT}"
+          mkdir -p "gh-pages/${FEED_ROOT}"
+
+          cp -a feed-publish/. "gh-pages/${FEED_ROOT}/"
+          mkdir -p "gh-pages/${FEED_ROOT}"
+          cp yggdrasil-feed.pem "gh-pages/${FEED_ROOT}/yggdrasil-feed.pem"
+
+          touch gh-pages/.nojekyll
+
+          cd gh-pages
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -A
+          git commit -m "Yggdrasil ${{ needs.check.outputs.tag }}" || exit 0
+          git push origin "${FEED_BRANCH}"
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
