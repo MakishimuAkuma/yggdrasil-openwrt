@@ -236,6 +236,13 @@ jobs:
           test -f luci-proto-yggdrasil/root/usr/share/rpcd/acl.d/luci-proto-yggdrasil.json
           test -f luci-proto-yggdrasil/htdocs/luci-static/resources/protocol/yggdrasil.js
 
+      - name: Prepare SDK directories
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+          mkdir -p "$GITHUB_WORKSPACE/artifacts/logs"
+
       - name: Build Yggdrasil and LuCI packages
         uses: openwrt/gh-action-sdk@main
         env:
