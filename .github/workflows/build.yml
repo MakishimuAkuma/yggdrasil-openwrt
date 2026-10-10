@@ -214,7 +214,8 @@ jobs:
           HASH: ${{ needs.check.outputs.hash }}
         run: |
           set -euo pipefail
-          source_url="https://codeload.github.com/yggdrasil-network/yggdrasil-go/tar.gz/v${VERSION}"
+
+          source_url="https://codeload.github.com/yggdrasil-network/yggdrasil-go/tar.gz/v${VERSION}?"
 
           sed -i \
             -e "s/^PKG_VERSION:=.*/PKG_VERSION:=${VERSION}/" \
@@ -222,7 +223,8 @@ jobs:
             -e "s/^PKG_HASH:=.*/PKG_HASH:=${HASH}/" \
             yggdrasil/Makefile
 
-          grep -E '^PKG_(NAME|VERSION|RELEASE|SOURCE|SOURCE_URL|SOURCE_SUBDIR|HASH):' yggdrasil/Makefile
+          grep -E '^PKG_(NAME|VERSION|RELEASE|SOURCE|SOURCE_URL|BUILD_DIR|HASH):' \
+            yggdrasil/Makefile
 
       - name: Verify package files
         shell: bash
