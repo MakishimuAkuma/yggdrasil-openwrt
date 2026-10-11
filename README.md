@@ -3,7 +3,7 @@
 ### Install trust key once
 
 ```sh
-wget -qO "/etc/apk/keys/yggdrasil-feed.pem" "https://makishimuakuma.github.io/yggdrasil-openwrt/25.12/$(cat /etc/apk/arch)/yggdrasil-feed.pub.pem"
+wget -qO "/etc/apk/keys/yggdrasil-feed.pem" "https://makishimuakuma.github.io/yggdrasil-openwrt/25.12/yggdrasil-feed.pub.pem"
 ```
 
 ### Add repository
