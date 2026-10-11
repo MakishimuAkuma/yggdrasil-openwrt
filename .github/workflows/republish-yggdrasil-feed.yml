@@ -1,0 +1,194 @@
+name: Republish Yggdrasil APK feed from existing artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: "Actions run ID that contains yggdrasil-artifact-* artifacts"
+        required: true
+        type: string
+      release_tag:
+        description: "Upstream release tag, for example v0.5.14"
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+
+env:
+  FEED_BRANCH: gh-pages
+  FEED_ROOT: 25.12
+
+jobs:
+  republish:
+    name: Republish existing APKs (no rebuild)
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Install GitHub CLI if missing
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v gh >/dev/null 2>&1; then
+            gh --version
+            exit 0
+          fi
+          version="2.74.2"
+          archive="$RUNNER_TEMP/gh.tar.gz"
+          install_dir="$RUNNER_TEMP/gh-cli"
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 \
+            "https://github.com/cli/cli/releases/download/v${version}/gh_${version}_linux_amd64.tar.gz" \
+            -o "$archive"
+          mkdir -p "$install_dir"
+          tar -xzf "$archive" -C "$install_dir"
+          echo "$install_dir/gh_${version}_linux_amd64/bin" >> "$GITHUB_PATH"
+          rm -f "$archive"
+
+      - name: Download existing build artifacts
+        uses: actions/download-artifact@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_run_id }}
+          pattern: yggdrasil-artifact-*
+          path: release-artifacts
+          merge-multiple: true
+
+      - name: Verify artifacts and prepare public signing key
+        shell: bash
+        env:
+          APK_SIGNING_KEY: ${{ secrets.APK_SIGNING_KEY }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          test -n "${APK_SIGNING_KEY:-}"
+          test -d release-artifacts/apk
+          test -d release-artifacts/feed
+
+          mapfile -t archs < <(find release-artifacts/feed -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort)
+          apk_count="$(find release-artifacts/apk -maxdepth 1 -type f -name '*.apk' | wc -l)"
+          echo "Release tag: ${RELEASE_TAG}"
+          echo "Architectures: ${#archs[@]}"
+          echo "APK assets: ${apk_count}"
+
+          if [ "${#archs[@]}" -eq 0 ]; then
+            echo "ERROR: No architecture feed directories downloaded."
+            find release-artifacts -maxdepth 4 -type f -print | sort || true
+            exit 1
+          fi
+          expected_apks=$(( ${#archs[@]} * 2 ))
+          if [ "$apk_count" -ne "$expected_apks" ]; then
+            echo "ERROR: Expected ${expected_apks} APKs, found ${apk_count}."
+            find release-artifacts -maxdepth 4 -type f -print | sort || true
+            exit 1
+          fi
+          for arch in "${archs[@]}"; do
+            test -f "release-artifacts/feed/${arch}/packages.adb"
+            find "release-artifacts/feed/${arch}" -maxdepth 1 -type f -name '*.apk' | grep -q .
+          done
+
+          printf '%s\n' "$APK_SIGNING_KEY" > "$RUNNER_TEMP/yggdrasil-apk-signing-key.pem"
+          chmod 600 "$RUNNER_TEMP/yggdrasil-apk-signing-key.pem"
+          openssl pkey -in "$RUNNER_TEMP/yggdrasil-apk-signing-key.pem" -pubout -out yggdrasil-feed.pub.pem
+          rm -f "$RUNNER_TEMP/yggdrasil-apk-signing-key.pem"
+          test -s yggdrasil-feed.pub.pem
+          printf '%s\n' "${archs[@]}" > "$RUNNER_TEMP/yggdrasil-archs.txt"
+          echo "Verified existing APKs and feed indexes."
+
+      - name: Create or update GitHub Release
+        timeout-minutes: 15
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          command -v gh
+          shopt -s nullglob
+          files=(release-artifacts/apk/*.apk yggdrasil-feed.pub.pem)
+          if [ "${#files[@]}" -lt 3 ]; then
+            echo "ERROR: Expected APK assets and public signing key."
+            exit 1
+          fi
+
+          retry() {
+            local attempt=1
+            local delays=(5 15 30 60)
+            while true; do
+              if "$@"; then return 0; fi
+              if [ "$attempt" -ge 5 ]; then
+                echo "ERROR: Command failed after 5 attempts."
+                return 1
+              fi
+              local delay="${delays[$((attempt - 1))]}"
+              echo "Attempt ${attempt} failed; retrying in ${delay}s..."
+              sleep "$delay"
+              attempt=$((attempt + 1))
+            done
+          }
+
+          # The failed original run already created this release; do not rebuild or create another one.
+          retry gh release view "$RELEASE_TAG" --repo "$GH_REPO" >/dev/null
+          retry gh release upload "$RELEASE_TAG" "${files[@]}" --repo "$GH_REPO" --clobber
+          echo "GitHub Release assets uploaded."
+
+      - name: Publish OpenWrt APK feed to gh-pages
+        timeout-minutes: 10
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          trap 'rm -rf "$work"' EXIT
+
+          retry() {
+            local attempt=1
+            local delays=(5 15 30 60)
+            while true; do
+              if "$@"; then return 0; fi
+              if [ "$attempt" -ge 5 ]; then
+                echo "ERROR: Command failed after 5 attempts."
+                return 1
+              fi
+              local delay="${delays[$((attempt - 1))]}"
+              echo "Attempt ${attempt} failed; retrying in ${delay}s..."
+              sleep "$delay"
+              attempt=$((attempt + 1))
+            done
+          }
+
+          retry git clone --depth 1 --branch "$FEED_BRANCH" \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GH_REPO}.git" "$work/repo"
+          repo="$work/repo"
+          mkdir -p "$repo/$FEED_ROOT"
+          while IFS= read -r arch; do
+            [ -n "$arch" ] || continue
+            test -d "release-artifacts/feed/${arch}"
+            rm -rf "$repo/$FEED_ROOT/$arch"
+            mkdir -p "$repo/$FEED_ROOT/$arch"
+            cp -a "release-artifacts/feed/${arch}/." "$repo/$FEED_ROOT/$arch/"
+          done < "$RUNNER_TEMP/yggdrasil-archs.txt"
+
+          cp yggdrasil-feed.pub.pem "$repo/$FEED_ROOT/yggdrasil-feed.pub.pem"
+          touch "$repo/.nojekyll"
+          cd "$repo"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$FEED_ROOT" .nojekyll
+          if git diff --cached --quiet; then
+            echo "Feed is already up to date."
+            exit 0
+          fi
+          git commit -m "Republish Yggdrasil ${RELEASE_TAG} APK feed"
+          retry git push origin "$FEED_BRANCH"
