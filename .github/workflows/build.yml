@@ -368,18 +368,68 @@ jobs:
 
           find release-artifacts -type f -print | sort
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ needs.check.outputs.tag }}
-          name: Yggdrasil ${{ needs.check.outputs.version }}
-          generate_release_notes: true
-          files: |
-            release-artifacts/apk/*.apk
-            yggdrasil-feed.pub.pem
-          fail_on_unmatched_files: true
+      - name: Create or update GitHub Release
+        timeout-minutes: 15
+        shell: bash
         env:
-          GITHUB_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.check.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          command -v gh
+
+          shopt -s nullglob
+          files=(release-artifacts/apk/*.apk yggdrasil-feed.pub.pem)
+
+          if [ "${#files[@]}" -lt 2 ]; then
+            echo "ERROR: Release assets are missing."
+            exit 1
+          fi
+
+          retry() {
+            local attempt=1
+            local delays=(5 15 30 60)
+
+            while true; do
+              if "$@"; then
+                return 0
+              fi
+
+              if [ "$attempt" -ge 5 ]; then
+                echo "ERROR: Command failed after 5 attempts."
+                return 1
+              fi
+
+              local delay="${delays[$((attempt - 1))]}"
+              echo "Attempt $attempt failed; retrying in ${delay}s..."
+              sleep "$delay"
+              attempt=$((attempt + 1))
+            done
+          }
+
+          # Reuse an existing release if a previous upload was interrupted.
+          if ! gh release view "$RELEASE_TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
+            if ! retry gh release create "$RELEASE_TAG" \
+                --repo "$GH_REPO" \
+                --title "Yggdrasil $RELEASE_VERSION" \
+                --generate-notes; then
+
+              echo "Release creation failed; checking whether it already exists."
+              retry gh release view "$RELEASE_TAG" \
+                --repo "$GH_REPO" >/dev/null
+            fi
+          fi
+
+          # Retry uploading all assets, replacing partial or existing uploads.
+          retry gh release upload "$RELEASE_TAG" \
+            "${files[@]}" \
+            --repo "$GH_REPO" \
+            --clobber
+
+          echo "Release assets uploaded successfully."
 
       - name: Publish OpenWrt APK feed to gh-pages
         shell: bash
