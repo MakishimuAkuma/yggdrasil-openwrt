@@ -414,7 +414,7 @@ jobs:
           if ! gh release view "$RELEASE_TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
             if ! retry gh release create "$RELEASE_TAG" \
                 --repo "$GH_REPO" \
-                --title "Yggdrasil $RELEASE_VERSION" \
+                --title "$RELEASE_VERSION" \
                 --generate-notes; then
 
               echo "Release creation failed; checking whether it already exists."
