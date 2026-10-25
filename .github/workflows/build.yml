@@ -41,7 +41,7 @@ jobs:
           command -v sha256sum
           command -v openssl
 
-      - name: Check latest stable Yggdrasil
+      - name: Check latest stable Yggdrasil release
         id: check
         shell: bash
         env:
@@ -49,74 +49,96 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "Checking Yggdrasil stable releases..."
-          release="$(
-            curl -fsSL --retry 3 --retry-delay 2 \
-              -H 'Accept: application/vnd.github+json' \
-              -H 'X-GitHub-Api-Version: 2022-11-28' \
-              'https://api.github.com/repos/yggdrasil-network/yggdrasil-go/releases?per_page=30' |
-            jq -er '[.[] | select(.draft == false and .prerelease == false)][0]'
-          )"
+          echo "Checking latest stable Yggdrasil release..."
 
-          tag="$(jq -er '.tag_name' <<<"$release")"
-          if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "ERROR: Unexpected stable release tag: $tag"
+          # GitHub's /releases/latest endpoint returns the latest published
+          # non-draft, non-prerelease release from upstream.
+          RELEASE_JSON="$(curl -fsSL --retry 3 --retry-delay 2 \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            'https://api.github.com/repos/yggdrasil-network/yggdrasil-go/releases/latest')"
+
+          UPSTREAM_TAG="$(jq -er '.tag_name' <<< "$RELEASE_JSON")"
+          if ! [[ "$UPSTREAM_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "ERROR: Unexpected stable release tag: ${UPSTREAM_TAG:-<empty>}"
             exit 1
           fi
-          version="${tag#v}"
+          UPSTREAM_VERSION="${UPSTREAM_TAG#v}"
+          echo "Latest stable Yggdrasil release: $UPSTREAM_TAG"
 
-          current="$(
-            sed -n 's/^PKG_VERSION:=//p' yggdrasil/Makefile | head -n 1
-          )"
-          test -n "$current" || {
-            echo "ERROR: PKG_VERSION not found in yggdrasil/Makefile"
-            exit 1
-          }
+          # Compare against this repository's latest stable GitHub Release,
+          # not the version currently written in yggdrasil/Makefile.
+          CURRENT_TAG="$(curl -fsSL --retry 3 --retry-delay 2 \
+            -H 'Accept: application/vnd.github+json' \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            | jq -r '[.[] | select(.draft == false and .prerelease == false) | select(.tag_name | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))][0].tag_name // ""')"
 
-          echo "Upstream stable: $version ($tag)"
-          echo "Package version: $current"
+          BUILD=false
+          if [ -z "$CURRENT_TAG" ]; then
+            BUILD=true
+            echo "No previous stable package release found."
+          else
+            CURRENT_VERSION="${CURRENT_TAG#v}"
+            echo "Latest package release: $CURRENT_TAG"
+
+            if [ "$(printf '%s\n%s\n' "$CURRENT_VERSION" "$UPSTREAM_VERSION" | sort -V | tail -n 1)" = "$UPSTREAM_VERSION" ] \
+              && [ "$CURRENT_VERSION" != "$UPSTREAM_VERSION" ]; then
+              BUILD=true
+              echo "New upstream release detected: $CURRENT_TAG -> $UPSTREAM_TAG"
+            else
+              echo "No newer upstream release; no build required."
+            fi
+          fi
+
+          # Do not automatically downgrade a newer manually maintained package.
+          MAKEFILE_VERSION="$(sed -n 's/^PKG_VERSION:=//p' yggdrasil/Makefile | head -n 1 || true)"
+          if [ -n "$MAKEFILE_VERSION" ] && \
+             [ "$(printf '%s\n%s\n' "$UPSTREAM_VERSION" "$MAKEFILE_VERSION" | sort -V | tail -n 1)" = "$MAKEFILE_VERSION" ] && \
+             [ "$MAKEFILE_VERSION" != "$UPSTREAM_VERSION" ]; then
+            echo "WARNING: Makefile version $MAKEFILE_VERSION is newer than upstream $UPSTREAM_VERSION."
+            BUILD=false
+          fi
+
           {
-            echo "tag=$tag"
-            echo "version=$version"
+            echo "build=$BUILD"
+            echo "version=$UPSTREAM_VERSION"
+            echo "tag=$UPSTREAM_TAG"
           } >> "$GITHUB_OUTPUT"
 
-          release_status="$(
-            curl -sS -o /dev/null -w '%{http_code}' \
-              -H 'Accept: application/vnd.github+json' \
-              -H "Authorization: Bearer ${GH_TOKEN}" \
-              -H 'X-GitHub-Api-Version: 2022-11-28' \
-              "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${tag}"
-          )"
+          if [ "$BUILD" != true ]; then
+            exit 0
+          fi
 
-          if [ "$current" = "$version" ]; then
-            if [ "$release_status" = "200" ]; then
-              echo "GitHub Release $tag already exists; nothing to build."
-              echo "build=false" >> "$GITHUB_OUTPUT"
-              exit 0
-            elif [ "$release_status" != "404" ]; then
-              echo "ERROR: Unexpected GitHub Release API status: $release_status"
+          source_url="https://codeload.github.com/yggdrasil-network/yggdrasil-go/tar.gz/v${UPSTREAM_VERSION}?"
+          HASH="$(curl -fsSL --retry 3 --retry-delay 2 "$source_url" | sha256sum | awk '{print $1}')"
+          echo "Source SHA256: $HASH"
+          echo "hash=$HASH" >> "$GITHUB_OUTPUT"
+
+          # Keep the package recipe in sync with the newly detected upstream release.
+          MAKEFILE='yggdrasil/Makefile'
+          test -f "$MAKEFILE"
+          sed -i \
+            -e "s/^PKG_VERSION:=.*/PKG_VERSION:=${UPSTREAM_VERSION}/" \
+            -e "s#^PKG_SOURCE_URL:=.*#PKG_SOURCE_URL:=${source_url}#" \
+            -e "s/^PKG_HASH:=.*/PKG_HASH:=${HASH}/" \
+            "$MAKEFILE"
+
+          grep -E '^PKG_(NAME|VERSION|RELEASE|SOURCE|SOURCE_URL|BUILD_DIR|HASH):' "$MAKEFILE"
+          git add "$MAKEFILE"
+          if ! git diff --cached --quiet; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git commit -m "Update Yggdrasil package to ${UPSTREAM_TAG}"
+            if [ "${GITHUB_REF_TYPE}" != 'branch' ]; then
+              echo "ERROR: Cannot push Makefile update because this workflow was not started from a branch ref."
               exit 1
             fi
-            echo "GitHub Release $tag does not exist. Rebuilding."
-          elif [ "$(printf '%s\n' "$current" "$version" | sort -V | tail -n 1)" = "$current" ]; then
-            echo "Local package version $current is newer than upstream $version."
-            echo "build=false" >> "$GITHUB_OUTPUT"
-            exit 0
+            git push origin "HEAD:${GITHUB_REF_NAME}"
           else
-            echo "New Yggdrasil version detected: $current -> $version"
+            echo "Makefile already contains the correct version and source hash."
           fi
-
-          source_url="https://codeload.github.com/yggdrasil-network/yggdrasil-go/tar.gz/${tag}"
-          hash="$(
-            curl -fsSL --retry 3 --retry-delay 2 "$source_url" |
-            sha256sum | awk '{print $1}'
-          )"
-          echo "Source SHA256: $hash"
-
-          {
-            echo "build=true"
-            echo "hash=$hash"
-          } >> "$GITHUB_OUTPUT"
 
   discover:
     name: Discover OpenWrt 25.12.5 architectures
